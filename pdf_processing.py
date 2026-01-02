@@ -676,30 +676,32 @@ def _is_extracted_data_from_index_page(drug_table: List[dict]) -> bool:
     page_number_ratio = page_number_pattern_count / total_records
     missing_both_ratio = missing_both_count / total_records
     category_ratio = category_header_count / total_records
+    
+    # DEBUG: Log the ratios for diagnosis
+    logger.info(f"🔍 Index detection stats: total={total_records}, page_num_pattern={page_number_pattern_count} ({page_number_ratio:.1%}), missing_both={missing_both_count} ({missing_both_ratio:.1%}), category_headers={category_header_count} ({category_ratio:.1%})")
 
     # If 40% or more entries have a clear page number pattern, it's an index.
     if page_number_ratio >= 0.4:
-        logger.info(f"Index page detected: {page_number_ratio:.1%} of entries have page number patterns.")
+        logger.info(f"⚠️ Index page detected: {page_number_ratio:.1%} of entries have page number patterns.")
         return True
 
-    # FIXED: Increased threshold from 95% to 98% to avoid false positives
-    # Some formularies (like Hennepin Health) may have legitimate pages where Special Code is empty
-    # but drug name and tier are present. Only flag as index if ALMOST ALL entries are missing both.
-    if False: # missing_both_ratio >= 0.98:  # Changed from 0.95 to 0.98 (98%)
-        logger.info(f"Index page detected: {missing_both_ratio:.1%} of entries missing both tier and requirements.")
-        return True
+    # DISABLED: This check was too aggressive - disabled for now
+    # if missing_both_ratio >= 0.98:
+    #     logger.info(f"Index page detected: {missing_both_ratio:.1%} of entries missing both tier and requirements.")
+    #     return True
 
     # If a high percentage of entries are category headers.
     if category_ratio >= 0.6:
-        logger.info(f"Index page detected: {category_ratio:.1%} of entries are category headers.")
+        logger.info(f"⚠️ Index page detected: {category_ratio:.1%} of entries are category headers.")
         return True
 
     # A combination of page numbers and missing data is also a strong signal.
     # FIXED: Increased missing_both_ratio threshold from 0.7 to 0.85 to be less aggressive
-    if page_number_ratio >= 0.2 and missing_both_ratio >= 0.85:  # Changed from 0.7 to 0.85
-        logger.info(f"Index page detected: Page numbers ({page_number_ratio:.1%}) + missing data ({missing_both_ratio:.1%}).")
+    if page_number_ratio >= 0.2 and missing_both_ratio >= 0.85:
+        logger.info(f"⚠️ Index page detected: Page numbers ({page_number_ratio:.1%}) + missing data ({missing_both_ratio:.1%}).")
         return True
-
+    
+    logger.info(f"✅ NOT an index page - passing through")
     return False
 
 def _consolidate_and_clean_drug_table(drug_table: List[dict]) -> List[dict]:
@@ -1634,14 +1636,15 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                                     "properties": {
                                         "DrugInformation": {
                                             "type": "array",
-                                            "description": "IMPORTANT: Extract EVERY SINGLE drug from the page. Handles TWO formats: 1) List format: 'DrugName (PA, QL)' 2) Table format with columns: Drug Name | Drug Tier | Requirements/Limits",
+                                            "description": "Extract drugs ONLY from actual drug listing pages. SKIP Index pages, Table of Contents, Introduction, Appendix, and pages that only list drug names alphabetically without tier/requirements columns. Only extract from pages with FULL drug details (name + tier OR name + requirements).",
                                             "items": {
                                                 "type": "object",
                                                 "properties": {
-                                                    "Drug Name": {"type": "string", "description": "COMPLETE drug name with form and dosage. Examples: 'APTIVUS ORAL CAPSULE 250 MG', 'atazanavir oral capsule 150 mg, 300 mg', 'BIKTARVY ORAL TABLET 30-120-15 MG, 50-200-25 MG', 'efavirenz oral tablet 600 mg'. Include ALL dosages/strengths listed."},
-                                                    "drug tier": {"type": ["string", "null"], "description": "From 'Drug Tier' column (1, 2, 3, 4) OR from page header ('3-Tier' → 'Tier 3'). Extract the tier number or tier name as shown."},
-                                                    "requirements": {"type": ["string", "null"], "description": "From 'Requirements/Limits' column. Include FULL text with quantity limits. Examples: 'QL (120 per 30 days)', 'PA', 'PA; LA', 'QL (30 per 30 days)', 'PA; QL (60 per 30 days)'. Keep the quantity limit details in parentheses."},
-                                                    "category": {"type": ["string", "null"], "description": "Section header if present: 'Infections', 'HIV/AIDS', 'Antivirals', etc. Null if no category shown."}
+                                                    "Drug Name": {"type": "string", "description": "COMPLETE drug name with form and dosage. Examples: 'APTIVUS ORAL CAPSULE 250 MG', 'atazanavir oral capsule 150 mg, 300 mg'. Include ALL dosages/strengths listed."},
+                                                    "drug tier": {"type": ["string", "null"], "description": "From 'Drug Tier' column (1, 2, 3, 4) OR from page header. Null if not shown."},
+                                                    "requirements": {"type": ["string", "null"], "description": "From 'Requirements/Limits' column. Include FULL text: 'QL (120 per 30 days)', 'PA', 'PA; LA'. Null if none."},
+                                                    "category": {"type": ["string", "null"], "description": "Section header: 'Infections', 'HIV/AIDS', etc. Null if none."},
+                                                    "page_number": {"type": ["integer", "null"], "description": "The actual page number where this drug is found in the document."}
                                                 }
                                             }
                                         },
@@ -1671,20 +1674,55 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                         )
                         
                         # Extract data from chunk response
+                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Processing response for pages {chunk_pages}")
+                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Has document_annotation: {hasattr(chunk_response, 'document_annotation')}")
+                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Num pages in response: {len(chunk_response.pages) if hasattr(chunk_response, 'pages') else 0}")
+                        
+                        chunk_drugs_found = 0
+                        
                         if hasattr(chunk_response, 'document_annotation') and chunk_response.document_annotation:
                             chunk_json = chunk_response.document_annotation
                             if isinstance(chunk_json, str):
                                 chunk_json = json.loads(chunk_json)
                             
-                            for item in chunk_json.get("DrugInformation", []):
+                            drug_info_list = chunk_json.get("DrugInformation", [])
+                            logger.info(f"🔍 Chunk {chunk_idx + 1}: Document-level has {len(drug_info_list)} drugs")
+                            
+                            for item in drug_info_list:
                                 if isinstance(item, dict):
+                                    drug_name = item.get("Drug Name", "")
+                                    # Skip index/TOC entries - they typically have no tier or requirements
+                                    if not drug_name or len(drug_name) < 2:
+                                        continue
+                                    
+                                    # PAGE MAPPING: OCR's page_number is within the extracted chunk (1, 2, 3...)
+                                    # We need to map it back to original page numbers using chunk_pages
+                                    ocr_page_num = item.get("page_number")
+                                    
+                                    # DEBUG: Log what OCR returned
+                                    if chunk_drugs_found < 3:  # Log first 3 for debugging
+                                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Drug '{drug_name[:30]}...' has ocr_page_num={ocr_page_num}")
+                                    
+                                    if ocr_page_num and isinstance(ocr_page_num, int) and 1 <= ocr_page_num <= len(chunk_pages):
+                                        # Map OCR page (1-based index within chunk) to original page number
+                                        actual_page = chunk_pages[ocr_page_num - 1]
+                                    else:
+                                        # If no page number or invalid, distribute evenly across chunk pages
+                                        # Use a simple heuristic: assign based on position in list
+                                        position_ratio = chunk_drugs_found / max(len(drug_info_list), 1)
+                                        page_index = min(int(position_ratio * len(chunk_pages)), len(chunk_pages) - 1)
+                                        actual_page = chunk_pages[page_index]
+                                    
+                                    logger.debug(f"Chunk {chunk_idx + 1}: OCR page_num={ocr_page_num} -> mapped to original page {actual_page}")
+                                    
                                     all_structured_data.append({
-                                        "drug_name": item.get("Drug Name"),
+                                        "drug_name": drug_name,
                                         "drug_tier": item.get("drug tier"),
                                         "drug_requirements": item.get("requirements"),
                                         "category": item.get("category"),
-                                        "page_number": chunk_pages[0]  # Approximate page
+                                        "page_number": actual_page
                                     })
+                                    chunk_drugs_found += 1
                             
                             for item in chunk_json.get("FormularyAbbreviations", []):
                                 if isinstance(item, dict):
@@ -1694,15 +1732,25 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                                         "explanation": item.get("Explanation")
                                     })
                         
+                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Document-level extraction found {chunk_drugs_found} drugs")
+                        
                         # Also check page-level annotations
+                        page_level_drugs_found = 0
                         for page_idx, page in enumerate(chunk_response.pages):
+                            # PAGE MAPPING: Map extracted page index to original page number
                             page_num = chunk_pages[page_idx] if page_idx < len(chunk_pages) else page_idx + 1
+                            logger.info(f"🔍 Chunk {chunk_idx + 1}, page_idx {page_idx} -> checking page-level for original page {page_num}")
+                            logger.info(f"🔍 Page {page_num} has document_annotation: {hasattr(page, 'document_annotation') and bool(page.document_annotation)}")
+                            
                             if hasattr(page, 'document_annotation') and page.document_annotation:
                                 page_json = page.document_annotation
                                 if isinstance(page_json, str):
                                     page_json = json.loads(page_json)
                                 if isinstance(page_json, dict):
-                                    for item in page_json.get("DrugInformation", []):
+                                    drugs_on_page = page_json.get("DrugInformation", [])
+                                    if drugs_on_page:
+                                        logger.info(f"✅ Page-level annotation: Found {len(drugs_on_page)} drugs on original page {page_num}")
+                                    for item in drugs_on_page:
                                         if isinstance(item, dict):
                                             all_structured_data.append({
                                                 "drug_name": item.get("Drug Name"),
@@ -1711,6 +1759,7 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                                                 "category": item.get("category"),
                                                 "page_number": page_num
                                             })
+                                            page_level_drugs_found += 1
                                     for item in page_json.get("FormularyAbbreviations", []):
                                         if isinstance(item, dict):
                                             all_acronyms.append({
@@ -1718,6 +1767,9 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                                                 "expansion": item.get("Expansion"),
                                                 "explanation": item.get("Explanation")
                                             })
+                        
+                        logger.info(f"🔍 Chunk {chunk_idx + 1}: Page-level extraction found {page_level_drugs_found} additional drugs")
+                        logger.info(f"📊 Chunk {chunk_idx + 1} TOTAL: {chunk_drugs_found + page_level_drugs_found} drugs from pages {chunk_pages}")
                         
                         total_pages_processed += len(chunk_response.pages)
                         
@@ -1745,6 +1797,21 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                 logger.info(f"✅ [PRIMARY FLOW SUCCESS] Chunked OCR extraction completed for {filename}.")
                 logger.info(f"📊 Extracted {len(all_structured_data)} drugs, {len(all_acronyms)} acronyms from {total_pages_processed} page(s) in {len(page_chunks)} chunks.")
                 
+                # Log page distribution for verification
+                if all_structured_data:
+                    page_counts = {}
+                    for drug in all_structured_data:
+                        p = drug.get('page_number')
+                        page_counts[p] = page_counts.get(p, 0) + 1
+                    logger.info(f"📄 Page distribution: {dict(sorted(page_counts.items()))}")
+                    # Log sample drugs for debugging
+                    logger.info(f"🔍 Sample drugs from extraction:")
+                    for i, drug in enumerate(all_structured_data[:5]):
+                        logger.info(f"   Drug {i+1}: '{drug.get('drug_name', '')[:50]}...' on page {drug.get('page_number')}")
+                else:
+                    logger.warning(f"⚠️ NO DRUGS EXTRACTED from chunked processing!")
+                
+                logger.info(f"🚀 RETURNING from chunked processing: {len(all_structured_data)} drugs in drug_table")
                 return full_structured_data, "[CHUNKED OCR EXTRACTION]", total_costs
             
             # For documents <= 8 pages, process normally (single request)
@@ -1763,14 +1830,15 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                         "properties": {
                             "DrugInformation": {
                                 "type": "array",
-                                "description": "IMPORTANT: Extract EVERY SINGLE drug from the page. Handles TWO formats: 1) List format: 'DrugName (PA, QL)' 2) Table format with columns: Drug Name | Drug Tier | Requirements/Limits",
+                                "description": "Extract drugs ONLY from actual drug listing pages. SKIP Index pages, Table of Contents, Introduction, Appendix, and pages that only list drug names alphabetically without tier/requirements columns. Only extract from pages with FULL drug details (name + tier OR name + requirements).",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "Drug Name": {"type": "string", "description": "COMPLETE drug name with form and dosage. Examples: 'APTIVUS ORAL CAPSULE 250 MG', 'atazanavir oral capsule 150 mg, 300 mg', 'BIKTARVY ORAL TABLET 30-120-15 MG, 50-200-25 MG', 'efavirenz oral tablet 600 mg'. Include ALL dosages/strengths listed."},
-                                        "drug tier": {"type": ["string", "null"], "description": "From 'Drug Tier' column (1, 2, 3, 4) OR from page header ('3-Tier' → 'Tier 3'). Extract the tier number or tier name as shown."},
-                                        "requirements": {"type": ["string", "null"], "description": "From 'Requirements/Limits' column. Include FULL text with quantity limits. Examples: 'QL (120 per 30 days)', 'PA', 'PA; LA', 'QL (30 per 30 days)', 'PA; QL (60 per 30 days)'. Keep the quantity limit details in parentheses."},
-                                        "category": {"type": ["string", "null"], "description": "Section header if present: 'Infections', 'HIV/AIDS', 'Antivirals', etc. Null if no category shown."}
+                                        "Drug Name": {"type": "string", "description": "COMPLETE drug name with form and dosage. Examples: 'APTIVUS ORAL CAPSULE 250 MG', 'atazanavir oral capsule 150 mg, 300 mg'. Include ALL dosages/strengths listed."},
+                                        "drug tier": {"type": ["string", "null"], "description": "From 'Drug Tier' column (1, 2, 3, 4) OR from page header. Null if not shown."},
+                                        "requirements": {"type": ["string", "null"], "description": "From 'Requirements/Limits' column. Include FULL text: 'QL (120 per 30 days)', 'PA', 'PA; LA'. Null if none."},
+                                        "category": {"type": ["string", "null"], "description": "Section header: 'Infections', 'HIV/AIDS', etc. Null if none."},
+                                        "page_number": {"type": ["integer", "null"], "description": "The actual page number where this drug is found in the document."}
                                     }
                                 }
                             },
@@ -1828,7 +1896,9 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
             # Option 2: Check pages for markdown content and parse JSON from it
             if not structured_json:
                 for page_idx, page in enumerate(ocr_response.pages):
+                    # FIXED PAGE MAPPING: Map extracted page index to original page number
                     page_num = original_pages[page_idx] if page_idx < len(original_pages) else page_idx + 1
+                    logger.debug(f"Non-chunked page_idx {page_idx} -> mapped to original page {page_num}")
                     logger.info(f"Page {page_num} attributes: {dir(page)}")
                     
                     # Check page.document_annotation
@@ -1842,7 +1912,10 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                             
                             # Extract from page-level structured data
                             if isinstance(page_json, dict):
-                                for item in page_json.get("DrugInformation", []):
+                                drugs_on_page = page_json.get("DrugInformation", [])
+                                if drugs_on_page:
+                                    logger.info(f"Page-level annotation: Found {len(drugs_on_page)} drugs on original page {page_num}")
+                                for item in drugs_on_page:
                                     if isinstance(item, dict):
                                         all_structured_data.append({
                                             "drug_name": item.get("Drug Name"),
@@ -1872,12 +1945,26 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
                 logger.info(f"Processing document-level structured JSON with keys: {structured_json.keys()}")
                 for item in structured_json.get("DrugInformation", []):
                     if isinstance(item, dict):
+                        # FIXED PAGE MAPPING: OCR's page_number is within the extracted document (1, 2, 3...)
+                        # We need to map it back to original page numbers using original_pages
+                        ocr_page_num = item.get("page_number")
+                        if ocr_page_num and original_pages and 1 <= ocr_page_num <= len(original_pages):
+                            # Map OCR page (1-based index within extracted doc) to original page number
+                            actual_page = original_pages[ocr_page_num - 1]
+                        elif original_pages:
+                            # Fallback to first page of extracted doc
+                            actual_page = original_pages[0]
+                        else:
+                            actual_page = ocr_page_num  # Last resort: use as-is
+                        
+                        logger.debug(f"Document-level: OCR page_num={ocr_page_num} -> mapped to original page {actual_page}")
+                        
                         all_structured_data.append({
                             "drug_name": item.get("Drug Name"),
                             "drug_tier": item.get("drug tier"),
                             "drug_requirements": item.get("requirements"),
                             "category": item.get("category"),
-                            "page_number": None
+                            "page_number": actual_page
                         })
                 for item in structured_json.get("FormularyAbbreviations", []):
                     if isinstance(item, dict):
@@ -1899,6 +1986,14 @@ def process_pdf_with_mistral_ocr(pdf_input, payer_name=None, filename: Optional[
 
             logger.info(f"✅ [PRIMARY FLOW SUCCESS] Native OCR extraction completed for {filename}.")
             logger.info(f"📊 Extracted {len(all_structured_data)} drugs, {len(all_acronyms)} acronyms from {total_costs['mistral_pages']} page(s).")
+            
+            # Log page distribution for verification
+            if all_structured_data:
+                page_counts = {}
+                for drug in all_structured_data:
+                    p = drug.get('page_number')
+                    page_counts[p] = page_counts.get(p, 0) + 1
+                logger.info(f"📄 Page distribution: {dict(sorted(page_counts.items()))}")
 
             # Delete file and return
             try:
@@ -2364,32 +2459,51 @@ def process_single_pdf_url_worker(plan_info):
         filename_for_config = f"{state_name}_{payer_name}_{plan_name}.pdf"
 
         if cached_data is None:
-            logger.info(f"{log_prefix} Cache MISS for new hash. Starting full processing...")
+            logger.info(f"🔄 {log_prefix} Cache MISS for new hash. Starting full processing...")
             full_structured_data, raw_content, costs = process_pdf_with_mistral_ocr(
                 pdf_bytes_io,
                 payer_name,
                 filename=filename_for_config
             )
+            logger.info(f"🔍 {log_prefix} process_pdf_with_mistral_ocr returned: {len(full_structured_data.get('drug_table', []))} drugs")
             cache_result(new_file_hash, full_structured_data, raw_content)
         else:
-            logger.info(f"{log_prefix} Cache HIT for new hash. Using pre-processed data.")
+            logger.info(f"💾 {log_prefix} Cache HIT for new hash. Using pre-processed data.")
             full_structured_data = cached_data
+            # Log cached data details
+            cached_drug_count = len(full_structured_data.get('drug_table', [])) if isinstance(full_structured_data, dict) else 0
+            logger.info(f"🔍 {log_prefix} Cached data has {cached_drug_count} drugs")
+            if cached_drug_count == 0:
+                logger.warning(f"⚠️ {log_prefix} Cache has ZERO drugs! Consider clearing cache for this hash: {new_file_hash}")
 
         if not isinstance(full_structured_data, dict):
             logger.error(f"{log_prefix} Corrupted cache or processing error. Expected a dictionary, got {type(full_structured_data)}")
             full_structured_data = {"drug_table": [], "acronyms": [], "tiers": []}
 
         drug_table_data = full_structured_data.get('drug_table', [])
+        
+        logger.info(f"🔍 {log_prefix} RECEIVED from process_pdf_with_mistral_ocr: {len(drug_table_data)} records")
 
         if drug_table_data:
             page_numbers = [r.get('page_number') for r in drug_table_data if r.get('page_number')]
             if page_numbers:
                 logger.info(f"{log_prefix} Initial extraction: {len(drug_table_data)} records from pages {min(page_numbers)}-{max(page_numbers)}")
-                logger.debug(f"{log_prefix} Page distribution: {dict(pd.Series(page_numbers).value_counts().sort_index().head(10))}")
+                logger.info(f"{log_prefix} Page distribution: {dict(pd.Series(page_numbers).value_counts().sort_index())}")
+            else:
+                logger.warning(f"🔍 {log_prefix} NO PAGE NUMBERS in any of the {len(drug_table_data)} records!")
+            
+            # Log sample drugs
+            logger.info(f"🔍 {log_prefix} Sample drugs received:")
+            for i, drug in enumerate(drug_table_data[:5]):
+                logger.info(f"   Drug {i+1}: '{drug.get('drug_name', '')[:50]}' | page={drug.get('page_number')} | tier={drug.get('drug_tier')}")
 
-        if drug_table_data and _is_extracted_data_from_index_page(drug_table_data):
-            logger.warning(f"{log_prefix} Detected index/TOC page based on extracted data patterns. Skipping this page.")
-            drug_table_data = []
+        # Check for index page but with detailed logging
+        if drug_table_data:
+            is_index = _is_extracted_data_from_index_page(drug_table_data)
+            logger.info(f"🔍 {log_prefix} _is_extracted_data_from_index_page returned: {is_index}")
+            if is_index:
+                logger.warning(f"⚠️ {log_prefix} Detected index/TOC page based on extracted data patterns. Clearing {len(drug_table_data)} records!")
+                drug_table_data = []
 
         if drug_table_data:
             logger.info(f"{log_prefix} Step 1: Running group propagation on {len(drug_table_data)} raw records.")
